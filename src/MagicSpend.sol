@@ -18,6 +18,8 @@ import {IEntryPoint} from "account-abstraction/interfaces/IEntryPoint.sol";
 contract MagicSpend is Ownable, IPaymaster {
     /// @notice Signed withdraw request allowing accounts to withdraw funds from this contract.
     struct WithdrawRequest {
+        /// @dev The service provider providing asset liquidity
+        address provider;
         /// @dev The signature associated with this withdraw request.
         bytes signature;
         /// @dev The asset to withdraw.
@@ -36,19 +38,59 @@ contract MagicSpend is Ownable, IPaymaster {
     /// @dev Helps prevent withdraws in the same transaction leading to reverts and hurting paymaster reputation.
     uint256 public maxWithdrawDenominator;
 
+    /// @notice Track the amount of native asset deposited in EntryPoint available to sponsor userOps per provider.
+    ///
+    /// @dev Providers must self-balance how much native asset they want to keep available for general withdraw requests
+    ///      versus sponsoring userOps with the `entryPointDeposited` and `entryPointWithdraw` functions.
+    mapping(address provider => uint256 amount) internal _entryPointLiquidity;
+
+    /// @notice Track the amount of asset liqduity available to be withdrawn per provider.
+    ///
+    /// @dev Native assets accounted here cannot be spent on userOp gas fees.
+    mapping(address provider => mapping(address asset => uint256 amount)) internal _liquidity;
+    
     /// @notice Track the amount of native asset available to be withdrawn per user.
     mapping(address user => uint256 amount) internal _withdrawable;
 
     /// @dev Mappings keeping track of already used nonces per user to prevent replays of withdraw requests.
     mapping(uint256 nonce => mapping(address user => bool used)) internal _nonceUsed;
 
+    /// @notice Emitted after providers deposit into MagicSpend
+    ///
+    /// @param provider The provider address.
+    /// @param asset   The asset deposited.
+    /// @param amount  The amount deposited.
+    event LiquidityDeposited(address indexed provider, address indexed asset, uint256 amount);
+    
+    /// @notice Emitted after providers deposit into EntryPoint
+    ///
+    /// @param provider The provider address.
+    /// @param amount  The amount deposited.
+    event EntryPointDeposited(address indexed provider, uint256 amount);
+    
+    /// @notice Emitted after providers withdraw liquidity from MagicSpend
+    ///
+    /// @dev This also includes liquidity rebalances of native asset into entryPoint deposit
+    ///
+    /// @param provider The provider address.
+    /// @param asset   The asset deposited.
+    /// @param amount  The amount deposited.
+    event LiquidityWithdrawn(address indexed provider, address indexed asset, uint256 amount);
+    
+    /// @notice Emitted after providers withdraw liquidity from EntryPoint
+    ///
+    /// @param provider The provider address.
+    /// @param amount  The amount deposited.
+    event EntryPointWithdrawn(address indexed provider, uint256 amount);
+
     /// @notice Emitted after validating a withdraw request and funds are about to be withdrawn.
     ///
+    /// @param provider The provider address.
     /// @param account The account address.
     /// @param asset   The asset withdrawn.
     /// @param amount  The amount withdrawn.
     /// @param nonce   The request nonce.
-    event MagicSpendWithdrawal(address indexed account, address indexed asset, uint256 amount, uint256 nonce);
+    event MagicSpendWithdrawal(address indexed provider, address indexed account, address indexed asset, uint256 amount, uint256 nonce);
 
     /// @notice Emitted when the `maxWithdrawDenominator` is set.
     ///
@@ -99,6 +141,15 @@ contract MagicSpend is Ownable, IPaymaster {
     ///      the user account refused the funds or ran out of gas on receive).
     error UnexpectedPostOpRevertedMode();
 
+    /// @notice Thrown when the providers liquidity is less than an amount of requested asset.
+    ///
+    /// @param requested The withdraw request amount.
+    /// @param liquidity The liquidity deposited by the provider to fund withdraw requests.
+    error ProviderLiquidityLessThanRequestedAmount(uint256 requested, uint256 liquidity);
+    
+    /// @notice Thrown when attempting to send native asset directly versus using `entryPointDeposit`.
+    error MustUseDeposit();
+
     /// @dev Requires that the caller is the EntryPoint.
     modifier onlyEntryPoint() virtual {
         if (msg.sender != entryPoint()) revert Unauthorized();
@@ -114,8 +165,10 @@ contract MagicSpend is Ownable, IPaymaster {
         _setMaxWithdrawDenominator(maxWithdrawDenominator_);
     }
 
-    /// @notice Receive function allowing ETH to be deposited in this contract.
-    receive() external payable {}
+    /// @notice Receive function disabled. All native asset deposits should be made through `entryPointDeposit`.
+    receive() external payable {
+        revert MustUseDeposit();
+    }
 
     /// @inheritdoc IPaymaster
     function validatePaymasterUserOp(UserOperation calldata userOp, bytes32, uint256 maxCost)
@@ -202,15 +255,35 @@ contract MagicSpend is Ownable, IPaymaster {
         _withdraw(withdrawRequest.asset, msg.sender, withdrawRequest.amount);
     }
 
+    /// @notice Deposits ERC20s into this contract for future withdraw requests.
+    ///
+    /// @dev Can only deposit ERC20s with this method, use `entryPointDeposited` for native asset.
+    ///
+    /// @param asset  The asset to deposit.
+    /// @param amount The amount to deposit.
+    function magicSpendDeposit(address asset, uint256 amount) external {
+        // reverts if fails to transfer ERC20s
+        SafeTransferLib.safeTransferFrom(asset, msg.sender, address(this), amount);
+
+        _assetLiquidity[msg.sender][asset] += amount;
+
+        emit LiquidityDeposited(msg.sender, asset, amount);
+    }
+
     /// @notice Withdraws funds from this contract.
     ///
-    /// @dev Reverts if not called by the owner of the contract.
+    /// @dev Reverts if calling provider does not have enough asset liquidity previously deposited.
     ///
     /// @param asset  The asset to withdraw.
     /// @param to     The beneficiary address.
     /// @param amount The amount to withdraw.
-    function ownerWithdraw(address asset, address to, uint256 amount) external onlyOwner {
+    function magicSpendWithdraw(address asset, address to, uint256 amount) external {
+        if (_liquidity[msg.sender][asset] < amount) {
+            revert ProviderLiquidityLessThanWithdrawAmount(amount, _liquidity[msg.sender][asset]);
+        }
         _withdraw(asset, to, amount);
+
+        emit LiquidityWithdrawn(msg.sender, asset, amount);
     }
 
     /// @notice Transfers ETH from this contract into the EntryPoint.
@@ -218,8 +291,28 @@ contract MagicSpend is Ownable, IPaymaster {
     /// @dev Reverts if not called by the owner of the contract.
     ///
     /// @param amount The amount to deposit on the the Entrypoint.
-    function entryPointDeposit(uint256 amount) external payable onlyOwner {
+    function entryPointDeposit(uint256 amount) external payable {
+        if (amount > msg.value) {
+            // deduct local liquidity to fund EntryPoint
+            uint256 deficitLiquidity = amount - msg.value;
+            uint256 reserveLiquidity = _assetLiquidity[msg.sender][address(0)];
+            if (deficitLiquidity > reserveLiquidity) {
+                revert ProviderLiquidityLessThanRequestedAmount(deficitLiquidity, reserveLiquidity);
+            }
+            _liquidity[msg.sender][address(0)] -= deficitLiquidity;
+            emit LiquidityWithdrawn(msg.sender, address(0), deficitLiquidity);
+        } else {
+            // add local liquidity from surplus
+            uint256 surplusLiquidity = msg.value - amount;
+            _liquidity[msg.sender][address(0)] += surplusLiquidity;
+            emit LiquidityDeposited(msg.sender, address(0), surplusLiquidity);
+        }
+        
+        _entryPointLiquidity[msg.sender] += amount;
+
         SafeTransferLib.safeTransferETH(entryPoint(), amount);
+
+        emit EntryPointDeposited(msg.sender, amount);
     }
 
     /// @notice Withdraws ETH from the EntryPoint.
@@ -228,8 +321,16 @@ contract MagicSpend is Ownable, IPaymaster {
     ///
     /// @param to     The beneficiary address.
     /// @param amount The amount to withdraw from the Entrypoint.
-    function entryPointWithdraw(address payable to, uint256 amount) external onlyOwner {
+    function entryPointWithdraw(address payable to, uint256 amount) external {
+        if (_entryPointLiquidity[msg.sender] < amount) {
+            revert ProviderLiquidityLessThanRequestedAmount(amount, _entryPointLiquidity[msg.sender]);
+        }
+
+        _entryPointLiquidity[msg.sender] -= amount;
+
         IEntryPoint(entryPoint()).withdrawTo(to, amount);
+
+        emit EntryPointWithdrawn(msg.sender, amount);
     }
 
     /// @notice Adds stake to the EntryPoint.
@@ -303,6 +404,7 @@ contract MagicSpend is Ownable, IPaymaster {
                 address(this),
                 account,
                 block.chainid,
+                withdrawRequest.provider,
                 withdrawRequest.asset,
                 withdrawRequest.amount,
                 withdrawRequest.nonce,
@@ -336,6 +438,7 @@ contract MagicSpend is Ownable, IPaymaster {
     ///
     /// @dev Runs all non-signature validation checks.
     /// @dev Reverts if the withdraw request nonce has already been used.
+    /// @dev Reverts if the provider's liquidity is too low.
     ///
     /// @param account         The account address.
     /// @param withdrawRequest The withdraw request to validate.
@@ -349,10 +452,16 @@ contract MagicSpend is Ownable, IPaymaster {
             revert WithdrawTooLarge(withdrawRequest.amount, maxAllowed);
         }
 
+        uint256 providerAssetLiquidity = _liquidity[withdrawRequest.provider][withdrawRequest.asset];
+        if (providerAssetLiquidity < withdrawRequest.amount) {
+            revert ProviderLiquidityLessThanWithdrawAmount(withdrawRequest.amount, providerAssetLiquidity);
+        }
+
+        _liquidity[withdrawRequest.provider][withdrawRequest.asset] -= withdrawRequest.amount;
         _nonceUsed[withdrawRequest.nonce][account] = true;
 
         // This is emitted ahead of fund transfer, but allows a consolidated code path
-        emit MagicSpendWithdrawal(account, withdrawRequest.asset, withdrawRequest.amount, withdrawRequest.nonce);
+        emit MagicSpendWithdrawal(withdrawRequest.provider, account, withdrawRequest.asset, withdrawRequest.amount, withdrawRequest.nonce);
     }
 
     /// @notice Withdraws funds from this contract.
